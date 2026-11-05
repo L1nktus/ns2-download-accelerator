@@ -1,5 +1,7 @@
 # NS2下载加速
 
+**简体中文** | [English](README.en.md)
+
 在 Mac 上为 Nintendo Switch / Switch 2 提供局域网 HTTP 下载代理，包含原生菜单栏 App、实时下载速度和可调整的低速恢复功能。
 
 ## AI 开发与维护说明
