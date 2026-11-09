@@ -56,7 +56,7 @@ class AppTests(unittest.TestCase):
                 self.assertEqual(result['total_bytes'],777777)
                 self.assertEqual(result['active_downloads'],2)
                 self.assertFalse(c.traffic_status(True,99,now=102)['available'])
-                self.assertFalse(c.traffic_status(True,42,now=111)['available'])
+                self.assertFalse(c.traffic_status(True,42,now=121)['available'])
                 self.assertFalse(c.traffic_status(False,42,now=102)['available'])
                 path.write_text('{bad')
                 self.assertFalse(c.traffic_status(True,42,now=102)['available'])

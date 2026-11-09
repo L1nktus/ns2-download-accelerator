@@ -9,4 +9,5 @@ ROOT=Path(__file__).resolve().parents[1]
 p=argparse.ArgumentParser();p.add_argument('--integration',action='store_true');args=p.parse_args()
 env=dict(os.environ);env['PYTHONPATH']=str(ROOT/'src/backend')+os.pathsep+str(ROOT/'tests')
 subprocess.run([sys.executable,'-m','unittest','discover','-s',str(ROOT/'tests'),'-p','test_*.py','-v'],env=env,check=True)
+subprocess.run([sys.executable,str(ROOT/'tests/check_native_snapshot.py')],env=env,check=True)
 if args.integration:subprocess.run([sys.executable,str(ROOT/'tests/integration_recovery.py')],env=env,check=True,timeout=50)

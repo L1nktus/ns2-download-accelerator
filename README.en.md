@@ -18,6 +18,15 @@ The Switch downloads through a Mac on the same local network. Outgoing connectio
 - Default slow-download recovery: **below 100 KB/s for 60 seconds → stop forwarding for 15 seconds → restart → observe for up to 180 seconds**. All four settings are editable. An observation timeout only records the result; it does not itself trigger another restart. At most two automatic recoveries occur per rolling 30 minutes. KB/s uses decimal bytes, not bits.
 - Closing the window keeps the service running; quitting the app stops it. Turning off the display is supported, but system sleep interrupts forwarding. The app does not manage display wakefulness or prevent sleep.
 
+## v1.5.0: lower idle overhead
+
+- Periodic refresh reads local state natively instead of repeatedly launching Python, launchctl, networksetup, or lsof during normal idle operation.
+- Safety polling runs about every 15 seconds when idle and every 2 seconds during active game downloads. Directory changes and new connections prompt updates; unchanged state does not redraw the UI.
+- Forwarding and monitoring processes write idle state files less often. Existing recovery thresholds, stop duration, and manual-stop priority are preserved.
+- In a 45-second idle sample on the original Mac, the app and two resident service processes used about 0.07% of one CPU core combined. This is not a whole-system wattage or battery-life measurement. Screen-lock states also differed between samples, so no energy-saving percentage can be inferred. Real game downloads still need validation.
+
+See the [changelog](CHANGELOG.md) for details.
+
 ## Build and use
 
 Requirements: macOS 14+, Xcode Command Line Tools, and Python 3.10+. Apple Silicon has been tested; the Intel build option has not been tested on Intel hardware. No third-party Python packages are required.
@@ -35,7 +44,7 @@ Copy `build/NS2下载加速.app` to Applications and open it. The build script o
 
 ## Validation and limitations
 
-At the initial public-source release, 40 backend unit/local-socket tests passed. An isolated recovery test verified a roughly 15-second forwarding outage and cancellation of a pending restart. Menu state and Dock hiding were checked on the original Mac.
+For v1.5.0, 43 backend unit/local-socket tests and 18 native snapshot checks passed. An isolated recovery test verified a roughly 15-second forwarding outage and cancellation of a pending restart. Menu state and Dock hiding were checked on the original Mac.
 
 The user has observed that restarting the service lets the Switch resume downloads automatically. Actual game-download speed readings in the latest UI, compatibility across devices, and the long-term effectiveness of automatic recovery still need further validation. Reconnecting is not guaranteed to improve speed every time.
 

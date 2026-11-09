@@ -261,6 +261,17 @@ class TrafficMeter:
         self.connections = {}
         self.next_id = 0
         self.pid = os.getpid()
+        self.changed = threading.Event()
+        self.listener_address = ''
+        self.listening = False
+
+    def set_listener(self, address, listening):
+        with self.lock:
+            state = (address or '', bool(listening))
+            if state == (self.listener_address, self.listening):
+                return
+            self.listener_address, self.listening = state
+        self.changed.set()
 
     def open(self, client, host):
         if not game_content_host(host):
@@ -271,7 +282,8 @@ class TrafficMeter:
             item = self.clients.setdefault(client, {'total_bytes': 0, 'active_downloads': 0})
             item['active_downloads'] += 1
             self.connections[token] = client
-            return token
+        self.changed.set()
+        return token
 
     def add(self, token, count):
         if token is not None:
@@ -285,10 +297,13 @@ class TrafficMeter:
             client = self.connections.pop(token, None)
             if client:
                 self.clients[client]['active_downloads'] -= 1
+        if client:
+            self.changed.set()
 
     def snapshot(self):
         with self.lock:
             return {'worker_pid': self.pid, 'time': time.monotonic(),
+                    'listening': self.listening, 'address': self.listener_address,
                     'clients': {k: dict(v) for k, v in self.clients.items()}}
 
     def publish(self):
@@ -297,13 +312,19 @@ class TrafficMeter:
         temporary.write_text(json.dumps(self.snapshot()))
         temporary.replace(self.path)
 
+    def sample_interval(self):
+        with self.lock:
+            return 2 if any(c['active_downloads'] > 0 for c in self.clients.values()) else 15
+
     def run(self):
         while True:
+            # Clear before snapshot so a new tunnel can never lose its wake-up.
+            self.changed.clear()
             try:
                 self.publish()
             except OSError:
                 LOG.warning('telemetry_write_failed')
-            time.sleep(1)
+            self.changed.wait(self.sample_interval())
 
 
 def splice(a, b, idle=300, on_receive=None):
@@ -438,6 +459,7 @@ def main():
                 if server:
                     server.server_close()
                     server = None
+                meter.set_listener(address, False)
                 LOG.info('network interface=%s address=%s allowed_subnet=%s', interface, address, network)
                 previous = address
                 if address:
@@ -447,7 +469,8 @@ def main():
                         server.meter = meter
                         server.allowed_client = config.get('allowed_client', '')
                         server.slots = threading.BoundedSemaphore(32)
-                        server.timeout = 1
+                        server.timeout = 5
+                        meter.set_listener(address, True)
                         LOG.info('listening address=%s port=%d outbound=physical-interface-direct', address, config['port'])
                     except OSError as exc:
                         LOG.error('listen_failed reason=%s', type(exc).__name__)
@@ -457,6 +480,7 @@ def main():
             else:
                 time.sleep(5)
     finally:
+        meter.set_listener('', False)
         if server:
             server.server_close()
         resolver.pool.shutdown(wait=False, cancel_futures=True)

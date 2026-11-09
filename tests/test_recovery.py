@@ -154,6 +154,44 @@ class RecoveryTests(unittest.TestCase):
             self.assertFalse(thread.is_alive());self.assertEqual(sum(seen),7)
         finally:
             for sock in (client,a,b,origin):sock.close()
+    def test_idle_heartbeat_is_sparse_but_changes_publish_immediately(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);conf=root/'config.json';conf.write_text('{}')
+            sup=supervisor.Supervisor(conf)
+            sup.publish(100)
+            self.assertEqual(json.loads(sup.state_path.read_text())['time'],100)
+            sup.publish(105)
+            self.assertEqual(json.loads(sup.state_path.read_text())['time'],100)
+            sup.publish(115)
+            self.assertEqual(json.loads(sup.state_path.read_text())['time'],115)
+            sup.policy.phase='stopped';sup.publish(116)
+            self.assertEqual(json.loads(sup.state_path.read_text())['phase'],'stopped')
+    def test_meter_wakes_on_tunnel_and_listener_changes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            meter=p.TrafficMeter(Path(temp)/'traffic.json')
+            self.assertEqual(meter.sample_interval(),15)
+            token=meter.open(CLIENT,'atum-a.p01.lp1.d4c.srv.nintendo.net')
+            self.assertTrue(meter.changed.is_set());self.assertEqual(meter.sample_interval(),2)
+            meter.changed.clear();meter.close(token)
+            self.assertTrue(meter.changed.is_set());self.assertEqual(meter.sample_interval(),15)
+            meter.changed.clear();meter.set_listener('192.168.50.1',True)
+            self.assertTrue(meter.changed.is_set())
+            self.assertTrue(meter.snapshot()['listening'])
+            self.assertEqual(meter.snapshot()['address'],'192.168.50.1')
+            meter.changed.clear();meter.set_listener('192.168.50.1',True)
+            self.assertFalse(meter.changed.is_set())
+            meter.set_listener('',False)
+            self.assertFalse(meter.snapshot()['listening'])
+    def test_idle_worker_heartbeat_fifteen_seconds_old_is_fresh(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);conf=root/'config.json';conf.write_text('{}')
+            sup=supervisor.Supervisor(conf)
+            class Worker:pid=1234
+            sup.child=Worker()
+            sup.traffic_path.write_text(json.dumps({'worker_pid':1234,'time':100,'clients':snapshot(2_000_000,0)}))
+            self.assertEqual(sup.traffic(115),snapshot(2_000_000,0))
+            self.assertEqual(sup.traffic(121),{})
+
     def test_attempt_budget_persisted_on_supervisor_restart(self):
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp);conf=root/'config.json';conf.write_text('{}')
@@ -166,7 +204,7 @@ class RecoveryTests(unittest.TestCase):
             sup=supervisor.Supervisor(conf)
             class Worker:pid=1234
             sup.child=Worker()
-            for pid,stamp in ((1235,time.monotonic()),(1234,time.monotonic()-20)):
+            for pid,stamp in ((1235,time.monotonic()),(1234,time.monotonic()-26)):
                 sup.traffic_path.write_text(json.dumps({'worker_pid':pid,'time':stamp,'clients':snapshot(2_000_000)}))
                 self.assertEqual(sup.traffic(time.monotonic()),{})
 

@@ -42,6 +42,8 @@ class Supervisor:
         self.event_offset = 0
         self.enabled = True
         self.settings_stamp = None
+        self.last_publication = None
+        self.last_publication_time = 0
         self.load_history()
 
     def load_history(self):
@@ -97,7 +99,7 @@ class Supervisor:
     def traffic(self, now):
         try:
             data = json.loads(self.traffic_path.read_text())
-            if self.child is None or data.get('worker_pid') != self.child.pid or not 0 <= now-data['time'] <= 10:
+            if self.child is None or data.get('worker_pid') != self.child.pid or not 0 <= now-data['time'] <= 20:
                 return {}
             return data['clients']
         except (OSError, ValueError, KeyError, TypeError):
@@ -125,6 +127,12 @@ class Supervisor:
                  'attempts': len(self.policy.attempts), 'events': self.records, 'enabled': self.enabled, 'last_result': self.policy.last_result,
                  'rule': {'threshold_kbps': self.policy.threshold/1000, 'low_seconds': self.policy.low_seconds, 'pause_seconds': self.pause_seconds, 'wait_seconds': self.policy.wait_seconds},
                  'attempts_epoch': [time.time()-(now-t) for t in self.policy.attempts]}
+        # Epoch budget timestamps are persisted only with an actual publication.
+        signature = {k: v for k, v in state.items() if k not in ('time', 'attempts_epoch')}
+        if signature == self.last_publication and 0 <= now-self.last_publication_time < 15:
+            return
+        self.last_publication = signature
+        self.last_publication_time = now
         tmp = self.state_path.with_suffix('.tmp')
         tmp.write_text(json.dumps(state, ensure_ascii=False))
         tmp.replace(self.state_path)
@@ -162,7 +170,8 @@ class Supervisor:
                         self.pause_deadline = self.pause_started+self.pause_seconds
                         self.record(f'自动恢复：{reason}；停止 {self.pause_seconds:g} 秒后启动。')
                 self.publish(time.monotonic())
-                self.stop_event.wait(1)
+                # Policy/config stays on a 5s cadence; only the stop countdown needs 1s.
+                self.stop_event.wait(1 if self.pause_deadline is not None else min(5, self.sample_seconds))
         finally:
             self.stop_worker()
             self.policy.phase = 'stopped'

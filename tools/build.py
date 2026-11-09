@@ -40,7 +40,7 @@ with tempfile.TemporaryDirectory(prefix='ns2-build-') as temp:
  swift=Path(temp)/'NS2Direct.swift';swift.write_text(source)
  subprocess.run(['xcrun','swiftc','-parse-as-library','-swift-version','5','-target',arch+'-apple-macosx14.0','-O','-framework','SwiftUI','-framework','AppKit','-o',str(mac/'NS2Direct'),str(swift)],check=True)
 shutil.copy2(ROOT/'LICENSE',res/'LICENSE');shutil.copy2(ROOT/'assets/AppIcon.icns',res/'AppIcon.icns')
-info={'CFBundleDevelopmentRegion':'zh_CN','CFBundleIdentifier':'com.local.ns2direct','CFBundleName':'NS2下载加速','CFBundleDisplayName':'NS2下载加速','CFBundleExecutable':'NS2Direct','CFBundlePackageType':'APPL','CFBundleShortVersionString':'1.4.1','CFBundleVersion':'141','CFBundleIconFile':'AppIcon','LSMinimumSystemVersion':'14.0','NSHighResolutionCapable':True,'LSUIElement':True,'NSLocalNetworkUsageDescription':'为同一局域网的 Nintendo Switch 提供下载转发及连接诊断。'}
+info={'CFBundleDevelopmentRegion':'zh_CN','CFBundleIdentifier':'com.local.ns2direct','CFBundleName':'NS2下载加速','CFBundleDisplayName':'NS2下载加速','CFBundleExecutable':'NS2Direct','CFBundlePackageType':'APPL','CFBundleShortVersionString':'1.5.0','CFBundleVersion':'150','CFBundleIconFile':'AppIcon','LSMinimumSystemVersion':'14.0','NSHighResolutionCapable':True,'LSUIElement':True,'NSLocalNetworkUsageDescription':'为同一局域网的 Nintendo Switch 提供下载转发及连接诊断。'}
 (output/'Contents/Info.plist').write_bytes(plistlib.dumps(info))
 subprocess.run(['/usr/bin/codesign','--force','--deep','--sign','-',str(output)],check=True)
 subprocess.run(['/usr/bin/codesign','--verify','--deep','--strict',str(output)],check=True)

@@ -1,8 +1,9 @@
 import SwiftUI
 import AppKit
 import Combine
+import Darwin
 
-struct Configuration: Codable {
+struct Configuration: Codable, Equatable {
     var interface: String
     var allowed_subnet: String
     var port: Int
@@ -16,13 +17,13 @@ struct Configuration: Codable {
     var launch_at_login: Bool
     static var empty: Configuration { Configuration(interface: "en0", allowed_subnet: "192.168.50.0/24", port: 8888, optimize_cdn: true, allowed_client: "", recovery_threshold_kbps: 100, recovery_low_seconds: 60, recovery_pause_seconds: 15, recovery_wait_seconds: 180, auto_recovery: true, launch_at_login: true) }
 }
-struct PhysicalInterface: Codable, Identifiable {
+struct PhysicalInterface: Codable, Identifiable, Equatable {
     var device: String
     var name: String
     var address: String
     var id: String { device }
 }
-struct RecoveryStatus: Codable {
+struct RecoveryStatus: Codable, Equatable {
     var phase: String
     var message: String
     var speed_mbps: Double
@@ -30,16 +31,17 @@ struct RecoveryStatus: Codable {
     var attempts: Int
     var events: [String]
 }
-struct TrafficStatus: Codable {
+struct TrafficStatus: Codable, Equatable {
     var available: Bool
     var worker_pid: Int?
     var time: Double?
     var total_bytes: Double?
     var active_downloads: Int?
 }
-struct ServiceStatus: Codable {
+struct ServiceStatus: Codable, Equatable {
     var config: Configuration
     var running: Bool
+    var pid: Int?
     var listening: Bool
     var address: String
     var home_network: Bool
@@ -54,6 +56,90 @@ struct Reply: Decodable {
     var result: ServiceStatus?
     enum CodingKeys: String, CodingKey { case ok, error, result }
 }
+
+// Snapshot reads are native and read-only: no Python, launchctl, lsof or DNS here.
+struct RuntimeTraffic: Decodable {
+    struct Client: Decodable { var total_bytes: Double; var active_downloads: Int }
+    var worker_pid: Int
+    var time: Double
+    var clients: [String: Client]
+    var listening: Bool?
+    var address: String?
+}
+struct RuntimeRecovery: Decodable {
+    var supervisor_pid: Int
+    var worker_pid: Int?
+    var time: Double
+}
+enum LocalStatus {
+    static var uptime: Double { ProcessInfo.processInfo.systemUptime }
+    static func alive(_ pid: Int) -> Bool { pid > 1 && (kill(pid_t(pid), 0) == 0 || errno == EPERM) }
+    static func address(_ interface: String) -> String {
+        var list: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&list) == 0 else { return "" }
+        defer { freeifaddrs(list) }
+        var cursor = list
+        while let item = cursor {
+            defer { cursor = item.pointee.ifa_next }
+            guard String(cString: item.pointee.ifa_name) == interface,
+                  let addr = item.pointee.ifa_addr, addr.pointee.sa_family == AF_INET else { continue }
+            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            if getnameinfo(addr, socklen_t(addr.pointee.sa_len), &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST) == 0 {
+                return String(cString: host)
+            }
+        }
+        return ""
+    }
+    static func inSubnet(_ address: String, _ cidr: String) -> Bool {
+        func number(_ value: String) -> UInt32? {
+            let parts = value.split(separator: ".", omittingEmptySubsequences: false)
+            guard parts.count == 4 else { return nil }
+            var result: UInt32 = 0
+            for part in parts { guard let n = UInt8(part) else { return nil }; result = (result << 8) | UInt32(n) }
+            return result
+        }
+        let parts = cidr.split(separator: "/")
+        guard parts.count == 2, let prefix = Int(parts[1]), (0...32).contains(prefix),
+              let network = number(String(parts[0])), let value = number(address) else { return false }
+        let mask = prefix == 0 ? UInt32(0) : UInt32.max << (32-prefix)
+        return value & mask == network & mask
+    }
+    static func read(base: URL, previous: ServiceStatus, now: Double = uptime,
+                     isAlive: (Int) -> Bool = alive, interfaceAddress: (String) -> String = address) throws -> ServiceStatus {
+        let decoder = JSONDecoder()
+        var state = previous
+        state.config = try decoder.decode(Configuration.self, from: Data(contentsOf: base.appendingPathComponent("config.json")))
+        state.address = interfaceAddress(state.config.interface)
+        state.home_network = inSubnet(state.address, state.config.allowed_subnet)
+        let recoveryData = try? Data(contentsOf: base.appendingPathComponent("runtime/recovery.json"))
+        let raw = recoveryData.flatMap { try? decoder.decode(RuntimeRecovery.self, from: $0) }
+        let fresh = raw.map { 0 <= now-$0.time && now-$0.time <= 25 && isAlive($0.supervisor_pid) } ?? false
+        let pid = fresh ? raw?.supervisor_pid : previous.pid
+        state.pid = pid
+        state.running = pid.map(isAlive) ?? false
+        state.recovery = fresh ? recoveryData.flatMap { try? decoder.decode(RecoveryStatus.self, from: $0) } : nil
+        state.listening = false
+        state.traffic = TrafficStatus(available: false)
+        if state.running && fresh, let worker = raw?.worker_pid, isAlive(worker),
+           let bytes = try? Data(contentsOf: base.appendingPathComponent("runtime/traffic.json")),
+           let traffic = try? decoder.decode(RuntimeTraffic.self, from: bytes),
+           traffic.worker_pid == worker, 0 <= now-traffic.time && now-traffic.time <= 20 {
+            state.listening = traffic.listening == true && state.home_network && traffic.address == state.address
+            if state.listening {
+                state.traffic = TrafficStatus(available: true, worker_pid: worker, time: traffic.time,
+                    total_bytes: traffic.clients.values.reduce(0) { $0 + max(0, $1.total_bytes) },
+                    active_downloads: traffic.clients.values.reduce(0) { $0 + max(0, $1.active_downloads) })
+            }
+        }
+        state.interfaces = previous.interfaces.map { item in
+            var item = item
+            item.address = interfaceAddress(item.device)
+            return item
+        }
+        return state
+    }
+}
+// END NATIVE SNAPSHOT READER
 
 @MainActor final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     static weak var shared: AppDelegate?
@@ -106,7 +192,7 @@ struct Reply: Decodable {
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
-    @objc private func about() { NSApp.orderFrontStandardAboutPanel(options: [.applicationName: "NS2下载加速", .applicationVersion: "1.4.1"]) }
+    @objc private func about() { NSApp.orderFrontStandardAboutPanel(options: [.applicationName: "NS2下载加速", .applicationVersion: "1.5.0"]) }
     private func installMainMenu() {
         let menu = NSMenu()
         let appItem = NSMenuItem(); menu.addItem(appItem)
@@ -146,6 +232,7 @@ struct Reply: Decodable {
     let indicator = NSTextField(labelWithString: "❌")
     var activated: (() -> Void)?
     var enabled = true
+    private var storedOn: Bool?
     private var hovered = false
     private var tracking: NSTrackingArea?
     override init(frame: NSRect) {
@@ -164,6 +251,8 @@ struct Reply: Decodable {
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     func update(enabled: Bool, on: Bool) {
+        guard self.enabled != enabled || storedOn != on else { return }
+        storedOn = on
         self.enabled = enabled
         indicator.stringValue = on ? "✅" : "❌"
         setAccessibilityValue(on ? "开启 ✅" : "关闭 ❌")
@@ -202,6 +291,8 @@ struct Reply: Decodable {
     private let menu = NSMenu(title: "下载控制")
     var controlMenu: NSMenu { menu }
     private var observer: AnyCancellable?
+    private var pendingUpdate = false
+    private var lastRender = ""
     private let titleItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     private let speedItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     private let addressItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
@@ -229,11 +320,19 @@ struct Reply: Decodable {
         menu.addItem(.separator())
         quitItem = menu.addItem(withTitle: "退出 NS2下载加速", action: #selector(quit), keyEquivalent: ""); quitItem.target = self
         observer = model.objectWillChange.sink { [weak self] _ in
-            DispatchQueue.main.async { self?.update() }
+            guard let self = self, !self.pendingUpdate else { return }
+            self.pendingUpdate = true
+            DispatchQueue.main.async { [weak self] in self?.pendingUpdate = false; self?.update() }
         }
         update()
     }
     func update() {
+        let enabled = !model.busy && !model.terminating && model.status != nil
+        let render = [String(model.menuVisible), String(model.listening), model.title, model.speedText,
+                      model.status?.address ?? "", String(model.status?.config.port ?? 8888),
+                      String(model.serviceEnabled), String(enabled), String(model.terminating)].joined(separator: "|")
+        guard render != lastRender else { return }
+        lastRender = render
         if model.menuVisible && item == nil {
             item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
             item?.menu = menu
@@ -252,12 +351,11 @@ struct Reply: Decodable {
         speedItem.title = "NS2 下载速度：" + model.speedText
         addressItem.title = "服务器：" + (model.status?.address.isEmpty == false ? model.status!.address : "尚未连接")
         portItem.title = "端口：\(model.status?.config.port ?? 8888)"
-        let enabled = !model.busy && !model.terminating && model.status != nil
         serviceItem.isEnabled = enabled
         serviceRow.update(enabled: enabled, on: model.serviceEnabled)
         quitItem.isEnabled = !model.terminating
     }
-    func menuWillOpen(_ menu: NSMenu) { update() }
+    func menuWillOpen(_ menu: NSMenu) { model.readCurrentSnapshot(); update() }
     @objc private func toggleService() { model.setService(!model.serviceEnabled) }
     @objc private func showWindow() { model.openWindow() }
     @objc private func quit() { NSApp.terminate(nil) }
@@ -285,6 +383,10 @@ struct Reply: Decodable {
     private var initialized = false
     private var refreshing = false
     private var timer: Timer?
+    private var timerInterval = 0.0
+    private var source: DispatchSourceFileSystemObject?
+    private var pendingSnapshot: DispatchWorkItem?
+    private var lastFullRefresh = 0.0
     nonisolated static let base = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/NS2Proxy")
 
     init() {
@@ -294,11 +396,63 @@ struct Reply: Decodable {
         AppDelegate.model = self
         applyVisibility()
         action("start")
-        timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.refresh() }
-        }
-        if let timer = timer { RunLoop.main.add(timer, forMode: .common) }
+        watchRuntime()
+        scheduleTimer(active: false)
     }
+    private func scheduleTimer(active: Bool) {
+        let interval = active ? 2.0 : 15.0
+        guard interval != timerInterval else { return }
+        timerInterval = interval
+        timer?.invalidate()
+        let next = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.refreshLocal() }
+        }
+        next.tolerance = active ? 0.4 : 3
+        timer = next
+        RunLoop.main.add(next, forMode: .common)
+    }
+    private func watchRuntime() {
+        let runtime = Self.base.appendingPathComponent("runtime")
+        try? FileManager.default.createDirectory(at: runtime, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let fd = open(runtime.path, O_EVTONLY)
+        guard fd >= 0 else { return } // Timer remains a safety net.
+        let watcher = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: [.write, .rename, .delete], queue: .main)
+        watcher.setEventHandler { [weak self] in
+            guard let self = self else { return }
+            self.pendingSnapshot?.cancel()
+            let work = DispatchWorkItem { [weak self] in self?.refreshLocal() }
+            self.pendingSnapshot = work
+            DispatchQueue.main.asyncAfter(deadline: .now()+0.15, execute: work)
+        }
+        watcher.setCancelHandler { close(fd) }
+        source = watcher
+        watcher.resume()
+    }
+    private func refreshLocal() {
+        guard !busy, !refreshing, !terminating else { return }
+        guard let previous = status else {
+            if LocalStatus.uptime-lastFullRefresh >= 30 { refresh() }
+            return
+        }
+        do {
+            var state = try LocalStatus.read(base: Self.base, previous: previous)
+            if tab == 2, let config = try? Data(contentsOf: Self.base.appendingPathComponent("config.json")),
+               let object = try? JSONSerialization.jsonObject(with: config) as? [String: Any],
+               let path = object["log"] as? String, let handle = FileHandle(forReadingAtPath: path) {
+                let end = (try? handle.seekToEnd()) ?? 0
+                try? handle.seek(toOffset: end > 24000 ? end-24000 : 0)
+                if let data = try? handle.readToEnd(), let text = String(data: data, encoding: .utf8) {
+                    state.logs = text.split(separator: "\n").suffix(14).joined(separator: "\n")
+                }
+                try? handle.close()
+            }
+            apply(state)
+        } catch {
+            // Bounded full inspection only for corrupt/unavailable snapshots, never 2s spawning.
+            if LocalStatus.uptime-lastFullRefresh >= 30 { refresh() }
+        }
+    }
+
     var listening: Bool { status?.listening == true }
     var title: String {
         guard let s = status else { return "正在读取状态" }
@@ -358,18 +512,23 @@ struct Reply: Decodable {
         } catch { return (Data(), error.localizedDescription) }
     }
     private func apply(_ state: ServiceStatus, updateDraft: Bool = false) {
-        status = state
+        if status != state { status = state }
         let current = state.traffic
-        trafficAvailable = state.listening && current?.available == true
-        downloadSpeed = 0
+        let available = state.listening && current?.available == true
+        if trafficAvailable != available { trafficAvailable = available }
+        var speed = 0.0
         if trafficAvailable, let current = current, let previous = previousTraffic,
            previous.worker_pid == current.worker_pid,
            let now = current.time, let before = previous.time,
            let total = current.total_bytes, let oldTotal = previous.total_bytes,
            now > before, now - before <= 12, total >= oldTotal {
-            downloadSpeed = (total-oldTotal)/(now-before)
+            speed = (total-oldTotal)/(now-before)
+        } else if available && current?.time == previousTraffic?.time {
+            speed = downloadSpeed
         }
-        previousTraffic = trafficAvailable ? current : nil
+        if downloadSpeed != speed { downloadSpeed = speed }
+        previousTraffic = available ? current : nil
+        scheduleTimer(active: available && (current?.active_downloads ?? 0) > 0)
         if !initialized || updateDraft {
             draft = state.config
             portText = String(state.config.port)
@@ -383,6 +542,7 @@ struct Reply: Decodable {
     func refresh() {
         guard !busy, !refreshing, !terminating else { return }
         refreshing = true
+        lastFullRefresh = LocalStatus.uptime
         Task {
             let (data, failure) = await Task.detached { Self.invoke("status") }.value
             defer { refreshing = false }
@@ -481,7 +641,8 @@ struct Reply: Decodable {
             }
         }
     }
-    func openWindow() { AppDelegate.shared?.showMainWindow() }
+    func readCurrentSnapshot() { refreshLocal() }
+    func openWindow() { refreshLocal(); AppDelegate.shared?.showMainWindow() }
 }
 
 struct Card<Content: View>: View {
@@ -538,11 +699,15 @@ struct ContentView: View {
                 Text("息屏可用；睡眠管理请使用 Amphetamine。")
                 Spacer()
                 if model.busy { ProgressView().controlSize(.small) }
-                Text("1.4.1").foregroundStyle(.tertiary)
+                Text("1.5.0").foregroundStyle(.tertiary)
             }.font(.system(size: 11)).foregroundStyle(.secondary).padding(.horizontal, 28).padding(.vertical, 13)
         }
         .frame(minWidth: 760, idealWidth: 820, minHeight: 650, idealHeight: 720)
         .background(Color(nsColor: .windowBackgroundColor))
+        .onChange(of: model.tab) { _, tab in
+            if tab == 1 { model.refresh() } // Enumerate hardware only when options are opened.
+            else { model.readCurrentSnapshot() }
+        }
         .sheet(isPresented: $model.showResult) {
             VStack(alignment: .leading, spacing: 20) {
                 Label("检查结果", systemImage: "checkmark.circle").font(.title2.weight(.semibold))

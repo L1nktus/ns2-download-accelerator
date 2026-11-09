@@ -13,7 +13,7 @@
 - `src/backend/supervisor.py`：launchd 主进程，管理转发子进程、停服倒计时、历史和恢复次数预算。必须在停服期间存活。
 - `src/backend/proxy_accel.py`：实际监听及转发，DoH、候选 IP、访问限制、流量计数。计数发生在数据成功转给客户端之后。
 - `src/backend/recovery.py`：可测试的纯状态机与参数校验。无套接字和系统进程操作。
-- `tests/`：40 项自动测试及隔离停服集成测试。
+- `tests/`：43 项后端测试、18 项原生快照检查及隔离停服集成测试。
 
 `com.local.ns2proxy` 为每用户 launch agent。监控与转发分开，关闭控制窗口后继续工作；退出 App 会停止转发、监控并取消待执行恢复。重新打开 App 自动启动。首次安装前必须检查 bundle identifier/服务标签/端口是否与已有版本冲突。不要自动覆盖别的程序或使用者配置。
 
@@ -56,3 +56,11 @@ AppKit AppDelegate 持有 NSWindow（NSHostingView 渲染 SwiftUI 内容）和 N
 NSMenu 的服务项使用独立 ServiceMenuRow：左侧“下载服务”，最右侧 NSTextField 显示 ✅ 或 ❌，不依赖系统可忽略的 Label SF Symbol。支持点击、NSMenuItem action 和无障碍按钮。主窗口的“下载控制”应用菜单复用同一个菜单；状态栏标题与速度持续更新。只读状态项禁止点击。
 
 在原 Mac 验证 regular 与 UIElement 模式实际切换、隐藏后窗口可继续切页、重启后偏好保留；菜单启停后的可访问状态分别为开启 ✅ 和关闭 ❌。未进行单位网络上的真实 Switch 下载测试。网络后端与恢复规则本次不改。
+
+## 1.5 空闲开销优化
+
+App 定时状态刷新不再启动 Python/launchctl/networksetup/lsof。LocalStatus 原生读取 config/recovery/traffic，验证活进程 PID、单调时钟新鲜度、当前物理接口 IPv4、网段与监听地址。目录事件触发轻量刷新，并有 15 秒空闲/2 秒活动游戏下载的安全定时器；快照失效时完整诊断最多 30 秒一次，仅限需要修复的错误，正常空闲不周期调用。进入功能选项或主动刷新才重新枚举硬件。相同快照和菜单内容不重复发布或重绘。
+
+worker 的 traffic.json 新增 listening/address；活动游戏下载每 2 秒采样，空闲 15 秒心跳，开/关游戏内容连接与监听状态变化立即唤醒发布线程，不在每个数据块上打事件。监听等待超时 5 秒，实际入站连接立即唤醒，不延迟 TCP 接入。supervisor 仍每 5 秒判定策略，只有停服倒计时 1 秒检查；稳定状态 15 秒心跳，改变立即发布。worker 新鲜度上限 20 秒，supervisor 上限 25 秒，进程死亡检查独立于时间戳。
+
+不要删除这些健康校验，不要让过期文件把手动停止的服务显示为开启。测试包括 43 项 Python、18 项实际 Swift 快照检查，以及真实 15 秒隔离停服/取消重启。CPU 短测不是整机瓦数或实际 Switch 持续下载验证。无 caffeinate、电源断言或防睡眠改动。

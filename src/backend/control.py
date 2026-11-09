@@ -101,7 +101,7 @@ def traffic_status(running, worker_pid, *, now=None):
     try:
         sample=json.loads((BASE/'runtime/traffic.json').read_text())
         stamp=sample['time'];now=time.monotonic() if now is None else now
-        if sample['worker_pid']!=worker_pid or not 0 <= now-stamp <= 10:return empty
+        if sample['worker_pid']!=worker_pid or not 0 <= now-stamp <= 20:return empty
         clients=sample['clients'].values()
         total=sum(max(0,item['total_bytes']) for item in clients)
         active=sum(max(0,item.get('active_downloads',0)) for item in sample['clients'].values())
@@ -117,7 +117,7 @@ def status():
     recovery = None
     try:
         candidate = json.loads((BASE/'runtime/recovery.json').read_text())
-        if running and candidate.get('supervisor_pid') == pid and 0 <= time.monotonic()-candidate['time'] <= 12:
+        if running and candidate.get('supervisor_pid') == pid and 0 <= time.monotonic()-candidate['time'] <= 25:
             recovery = candidate
     except (OSError, ValueError, KeyError, TypeError):
         pass
